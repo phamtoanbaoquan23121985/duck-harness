@@ -35,6 +35,7 @@ from inference.agent.runtime_state import (
     write_runtime_state,
 )
 from inference.agent.tool_agent import ToolAgent
+from inference.agent.sobu_omega import SobuOmegaController
 from inference.framework.kaggle import (
     DEFAULT_QWEN_MODEL_DATASET_SOURCE,
     DEFAULT_SERVED_MODEL_NAME,
@@ -183,6 +184,8 @@ class _HarnessGameSession:
     last_engine_action: str | None = None
     token_baseline: int = 0
     _viewer_events_flushed: int = field(default=0, init=False, repr=False)
+    sobu: SobuOmegaController = field(default_factory=SobuOmegaController, init=False, repr=False)
+    sobu_events: list[dict[str, Any]] = field(default_factory=list, init=False, repr=False)
 
     def current_frame(self) -> Frame:
         return Frame(
@@ -466,6 +469,9 @@ class _HarnessGameSession:
             "lastEvent": last_event,
             "viewer_steps": [],
             "replay_url": self.analysis_html_relpath,
+            "sobu_mode": str(self.solver.sobu_mode or "off"),
+            "sobu_event_count": len(self.sobu_events),
+            "sobu_events": self.sobu_events[-200:],
         }
         if run is not None:
             payload.update(
@@ -585,6 +591,15 @@ class _HarnessGameSession:
             **self.timing_payload(),
         }
 
+    def _sobu_state_key(self) -> tuple[int, tuple[tuple[int, ...], ...]]:
+        return (_level_number(self.game), _grid_from_state(self.game.current_state))
+
+    def _sobu_assessment(self, action: arcengine.ActionInput) -> tuple[Any, str, Any]:
+        state_key = self._sobu_state_key()
+        display = _format_action_display(action.id.name, dict(action.data))
+        utility = self.sobu.assess(state_key, display)
+        return state_key, display, utility
+
     def step_env(self, arguments: dict[str, Any]) -> dict[str, Any]:
         requested_actions, error = self._normalize_actions(arguments)
         if error is not None or requested_actions is None:
@@ -612,6 +627,28 @@ class _HarnessGameSession:
                     break
                 return self._error_payload(message)
 
+            sobu_state_key, sobu_display, sobu_utility = self._sobu_assessment(action)
+            sobu_mode = str(self.solver.sobu_mode or "off").strip().lower()
+            if sobu_mode not in {"off", "shadow", "control"}:
+                sobu_mode = "off"
+            if sobu_mode != "off":
+                self.sobu_events.append({
+                    "action_num": self.action_count + 1,
+                    "mode": sobu_mode,
+                    "action": sobu_display,
+                    "utility": sobu_utility.value,
+                    "lcb": sobu_utility.lcb,
+                    "hard_veto": sobu_utility.hard_veto,
+                })
+            if sobu_mode == "control" and sobu_utility.hard_veto:
+                message = f"SOBU rejected empirically dead action: {sobu_display}. Re-plan using another valid action."
+                if executed_payloads:
+                    stop_reason = "sobu_veto"
+                    break
+                result = self._error_payload(message)
+                result["sobu"] = {"mode": sobu_mode, "action": sobu_display, "hard_veto": True, "lcb": sobu_utility.lcb}
+                return result
+
             try:
                 payload = self._execute_action(
                     action,
@@ -624,6 +661,16 @@ class _HarnessGameSession:
                     stop_reason = "action_error"
                     break
                 return self._error_payload(f"{type(exc).__name__}: {exc}")
+            if sobu_mode != "off":
+                self.sobu.observe(
+                    sobu_state_key,
+                    sobu_display,
+                    goal_progress=bool(payload.get("level_completed") or payload.get("run_complete") or float(payload.get("reward", 0.0) or 0.0) > 0.0),
+                    board_changed=bool(payload.get("board_changed")),
+                    fatal=bool(payload.get("game_over")),
+                )
+                post_u = self.sobu.assess(sobu_state_key, sobu_display)
+                payload["sobu"] = {"mode": sobu_mode, "action": sobu_display, "utility": post_u.value, "lcb": post_u.lcb, "hard_veto": post_u.hard_veto}
             executed_payloads.append(payload)
             total_reward += float(payload.get("reward", 0.0) or 0.0)
 
@@ -740,6 +787,7 @@ class HarnessSolver(Solver):
 
     label: str = "HarnessSolver"
     model: str = ""
+    sobu_mode: str = field(default_factory=lambda: os.environ.get("ARC3_SOBU_MODE", "off"))
     analyzer_timeout: float | None = 120.0
     max_actions_per_game: int | None = None
     max_runtime_s_per_game: float | None = None
