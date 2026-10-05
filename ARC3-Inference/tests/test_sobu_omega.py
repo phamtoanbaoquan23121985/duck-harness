@@ -28,3 +28,18 @@ def test_choose_avoids_empirically_dead_action():
     for _ in range(2):
         c.observe("s0", "LEFT", goal_progress=False, board_changed=False)
     assert c.choose("s0", ["LEFT", "RIGHT"], decision_information={"RIGHT": 1.0}) == "RIGHT"
+
+
+def test_information_value_decays_after_repeated_probe():
+    c = SobuOmegaController()
+    first = c.assess("s0", "UP", decision_information=1.0).information
+    c.observe("s0", "UP", goal_progress=False, board_changed=False)
+    later = c.assess("s0", "UP", decision_information=1.0).information
+    assert later < first
+
+def test_fail_open_when_all_candidates_are_vetoed():
+    c = SobuOmegaController()
+    for action in ("LEFT", "RIGHT"):
+        for _ in range(2):
+            c.observe("s0", action, goal_progress=False, board_changed=False)
+    assert c.choose("s0", ["LEFT", "RIGHT"]) == "LEFT"
